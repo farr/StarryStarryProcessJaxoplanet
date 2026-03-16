@@ -1,0 +1,17 @@
+[project]
+name = "starrystarryprocessjaxoplanet"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "arviz>=1.0.0",
+    "astropy>=7.2.0",
+    "ipykernel>=7.2.0",
+    "jax>=0.9.1",
+    "jaxoplanet>=0.1.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.3",
+    "numpyro>=0.20.0",
+    "seaborn>=0.13.2",
+]
