@@ -33,7 +33,7 @@ def Umn(m, n):
         term2 = 1
     return term1 * term2 * 1 / jnp.sqrt(2) * (kron(m, n) + kron(m, -n) + 0j)
 
-def U(l):
+def Uylm(l):
     """Compute the complete U transformation matrix.. This part is from starry"""
     res = jnp.zeros((2 * l + 1, 2 * l + 1)) + 0j
     for m in range(-l, l + 1):
@@ -162,7 +162,7 @@ def Qllambda(l, lp):
 
 def ebar_func(er, l):
     er_array = jnp.array([er[l, m] for m in range(-l, l + 1)])
-    ebar = U(l) @ er_array
+    ebar = Uylm(l) @ er_array
 
     return ebar
 
@@ -182,8 +182,7 @@ def pllambdam(l, ebarphi, q):
 
 
 def Pllpphimmp(l, lp, alpha, beta, ebar, ebarp, Q, C_l, C_lp):
-    """The whole (2l+1, 2lp+1) P^{l,l'}_phi block.
-    """
+    """The whole (2l+1, 2lp+1) P^{l,l'}_phi block."""
     c1 = C_l[:, l, :]                  # (m, i)
     c2 = C_lp[:, lp, :]                # (mp, ip)
     i = jnp.arange(2*l + 1)[:, None]
@@ -256,7 +255,7 @@ def compute_first_moment(alpha, beta, r, c, lmax):
     elambda = []
 
     for l in range(0, lmax + 1):
-        u = U(l)
+        u = Uylm(l)
 
         q_phi_l = qlphi(alpha, beta, l)
         q_lambda_l = qllambda(l)
@@ -282,7 +281,7 @@ def compute_second_moment(alpha, beta, r, c, lmax):
     N = (lmax + 1) ** 2
     er = compute_radius_moment(lmax, r, c)
 
-    Us = [U(l) for l in range(lmax + 1)]
+    Us = [Uylm(l) for l in range(lmax + 1)]
     Cs = [clmmpi_tensor(l) for l in range(lmax + 1)]
 
     Elambda = jnp.zeros((N, N), dtype=jnp.complex128)
@@ -327,3 +326,76 @@ def compute_mean(alpha, beta, r, c, n, lmax):
 @partial(jax.jit, static_argnames="lmax")
 def compute_covariance(alpha, beta, r, c, n, lmax):
     return n * compute_covariance_one(alpha, beta, r, c, lmax)
+
+import jax.scipy.special as jss
+from jaxoplanet.starry.core.rotation import dot_rotation_matrix
+
+def qlI(l, imax=None):
+    if imax is None:
+        imax = 2 * l
+    i = jnp.arange(imax + 1)
+    F = jss.hyp2f1(1.0, -i / 2.0, 2.0 + (2 * l - i) / 2.0, -1.0)
+    return (-1.0) ** i / ((2 * l - i) / 2.0 + 1.0) * F
+
+
+def QllI(l, lp):
+    L = l + lp
+    return qlI(L, 2 * L)
+
+
+def Rx(lmax, angle, y):
+    return dot_rotation_matrix(lmax, 1.0, 0.0, 0.0, angle)(y)
+
+
+def plIm(l, ebar, q):
+    C = clmmpi_tensor(l)
+    m = jnp.arange(-l, l + 1)[:, None]
+    mu = jnp.arange(-l, l + 1)[None, :]
+    S = jnp.einsum('aui,i->au', C, q)
+    return jnp.einsum('u,au,au->a', ebar, jnp.exp(1j * jnp.pi / 2 * (m - mu)), S)
+
+
+def PllImmp(l, lp, Ebar_block, Q, C_l, C_lp):
+    i = jnp.arange(2 * l + 1)[:, None]
+    ip = jnp.arange(2 * lp + 1)[None, :]
+    T = jnp.einsum('aui,bvj,ij->aubv', C_l, C_lp, Q[i + ip])
+    m = jnp.arange(-l, l + 1)[:, None, None, None]
+    mu = jnp.arange(-l, l + 1)[None, :, None, None]
+    mp = jnp.arange(-lp, lp + 1)[None, None, :, None]
+    mup = jnp.arange(-lp, lp + 1)[None, None, None, :]
+    phase = jnp.exp(1j * jnp.pi / 2 * (m - mu + mp - mup))
+    return jnp.einsum('uv,aubv,aubv->ab', Ebar_block, phase, T)
+
+@partial(jax.jit, static_argnames="lmax")
+def compute_first_moment_marginalized(ey, lmax):
+    N = (lmax + 1) ** 2
+    ey0 = jnp.real(Rx(lmax, jnp.pi / 2, ey))
+
+    ey00 = []
+    for l in range(lmax + 1):
+        u = Uylm(l)
+        ebar = u @ ey0[l**2:l**2 + 2*l + 1]
+        pI = plIm(l, ebar, qlI(l))
+        ey00.append(jnp.real(jnp.conj(u.T) @ pI))
+
+    return jnp.concatenate(ey00)
+
+@partial(jax.jit, static_argnames="lmax")
+def compute_second_moment_marginalized(Ey, lmax):
+    N = (lmax + 1) ** 2
+    Rxhalf = Rx(lmax, jnp.pi / 2, jnp.eye(N))
+    Ey0 = Rxhalf @ Ey @ Rxhalf.T
+
+    Us = [Uylm(l) for l in range(lmax + 1)]
+    Cs = [clmmpi_tensor(l) for l in range(lmax + 1)]
+
+    Ey00 = jnp.zeros((N, N), dtype=jnp.complex128)
+    for l in range(lmax + 1):
+        for lp in range(lmax + 1):
+            blk = Ey0[l**2:l**2 + 2*l + 1, lp**2:lp**2 + 2*lp + 1]
+            Ebar = Us[l] @ blk @ jnp.conj(Us[lp]).T
+            PllI = PllImmp(l, lp, Ebar, QllI(l, lp), Cs[l], Cs[lp])
+            block = jnp.conj(Us[l]).T @ PllI @ jnp.conj(Us[lp])
+            Ey00 = Ey00.at[l**2:l**2 + 2*l + 1, lp**2:lp**2 + 2*lp + 1].set(block)
+
+    return jnp.real(Ey00)
