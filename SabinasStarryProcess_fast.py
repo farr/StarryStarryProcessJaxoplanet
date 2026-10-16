@@ -119,7 +119,7 @@ def clmmpi_sequence(l, m, mp, imax=None):
 
 
 # Manual cache of all Wigner-d coefficient tensors through a requested lmax.
-# As with Uylm, each degree occupies the square index block l**2:(l+1)**2
+# The same as with Uylm, each degree occupies the square index block l**2:(l+1)**2
 # along the m and m' axes. The final axis stores i=0,...,2*lmax; each degree
 # uses only its first 2*l+1 entries.
 _clmmpi_cache = {}
@@ -185,9 +185,8 @@ def Qllpphi(alpha, beta, l, lp):
     return gamma_sequence1(L, alpha, beta, 2*L) * hyp2f1_sequence(L, alpha, beta, 2*L)
 
 
-# alpha = beta = 1 here, so these sequences are constants. Evaluate them
-# and cache them like Uylm, instead of
-# staging scans into every compiled graph.
+# These sequences only depend on L. Evaluate them
+# and cache them like Uylm, instead of staging scans.
 _qlambda_cache = {}
 
 
@@ -323,8 +322,7 @@ def _spot_basis(lmax, spts, eps, smoothing):
 
 
 def compute_radius_moment(lmax, r, c, smoothing=0.075, spts=1000, eps=1e-9, sfac=300):
-    """Same coefficients as compute_radius_moment, but as a plain dense vector
-    (no Ylm object): er[l, m] == y[l**2 + l + m], so degree l is y[l**2:(l+1)**2]."""
+
     theta, Bp, idx = _spot_basis(lmax, spts, eps, smoothing)
     z = sfac * (theta - r)
     b = 1.0 / (1.0 + jnp.exp(-z)) - 1.0
