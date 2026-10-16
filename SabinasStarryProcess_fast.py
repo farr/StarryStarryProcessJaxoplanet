@@ -63,7 +63,7 @@ def _U_block(U_all, l):
     return jnp.asarray(U_all[start:stop, start:stop])
 
 def Uylm(l):
-    """Backward-compatible degree-l transformation matrix."""
+    """Full degree-l transformation matrix."""
     return _U_block(set_Uylm(l), l)
 
 def clmmpi_sequence(l, m, mp, imax=None):
@@ -173,7 +173,7 @@ def _C_block(C_all, l):
 
 
 def clmmpi_tensor(l):
-    """Backward-compatible accessor for the degree-l coefficient tensor."""
+    """Full access function for the degree-l coefficient tensor."""
     return _C_block(set_clmmpi_tensor(l), l)
 
 def qlphi(alpha, beta, l):
@@ -233,7 +233,7 @@ def beta_norm(alpha, beta):
 def Pllpphimmp(l, lp, alpha, beta, ebar, ebarp, Q, C_l, C_lp, term1=None):
     """The whole (2l+1, 2lp+1) P^{l,l'}_phi block.
 
-    Pass ``term1 = beta_norm(alpha, beta)`` when calling in a loop so it is
+    Pass term1 = beta_norm(alpha, beta) when calling in a loop so it is
     computed once rather than per block. Index arrays and phases are NumPy, so
     they are compile-time constants instead of traced ops.
     """
