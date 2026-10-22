@@ -8,7 +8,7 @@ import scipy
 from jaxoplanet.core.limb_dark import light_curve as _limb_dark_light_curve
 from jaxoplanet.starry.core.basis import A1, A2_inv, U
 from jaxoplanet.starry.core.polynomials import Pijk
-from jaxoplanet.starry.core.rotation import left_project
+from jaxoplanet.starry.core.rotation import left_project, dot_rotation_matrix, sky_projection_axis_angle
 from jaxoplanet.starry.core.solution import rT, solution_vector
 from jaxoplanet.starry.surface import Surface
 from jaxoplanet.starry.system_observable import system_observable
@@ -129,14 +129,26 @@ def design_matrix(
     norm = np.pi / (p_u.tosparse() @ rT(surface.udeg))
 
     N = (surface.ydeg + 1) ** 2
-    def one_col(theta_i, ej):
-        rotated_y = left_project(
-            surface.ydeg, surface._inc, surface._obl, theta_i, theta_z, ej
-        )
-        p_y = Pijk.from_dense(A1_val @ rotated_y, degree=surface.ydeg)
+    eye = jnp.eye(N)
+
+    # this version gives the same matrix with far fewer rotations, because
+    # the flux is a fixed linear function of the rotated map, so it reduces to one fixed vector
+    # the inclination and obliquity enter as a single rotation shared by all time steps
+    # only the cheap z-axis spin rotation changes with time
+    
+    def flux_of(y_rot):
+        p_y = Pijk.from_dense(A1_val @ y_rot, degree=surface.ydeg)
         p_yu = p_y * p_u
         return surface.amplitude * (p_yu.tosparse() @ design_matrix_p) * norm
 
-    over_basis = jax.vmap(one_col, in_axes=(None, 0))
-    over_time = jax.vmap(over_basis, in_axes=(0, None))
-    return jnp.real(over_time(theta, jnp.eye(N)))
+    w = jax.vmap(flux_of)(eye)
+
+    m_theta_z = -theta_z if theta_z is not None else theta_z
+    axis_x, axis_y, axis_z, angle = sky_projection_axis_angle(surface._inc, surface._obl)
+    T1 = dot_rotation_matrix(surface.ydeg, 1.0, None, None, -0.5 * jnp.pi)(eye)
+    T3 = dot_rotation_matrix(surface.ydeg, axis_x, axis_y, axis_z, angle)(eye)
+    T4 = dot_rotation_matrix(surface.ydeg, None, None, 1.0, m_theta_z)(eye)
+    v = T3 @ (T4 @ w)
+
+    T2 = jax.vmap(lambda th: dot_rotation_matrix(surface.ydeg, None, None, 1.0, -th)(eye))(jnp.atleast_1d(theta))
+    return jnp.real(jnp.einsum("kjl,l->kj", T2, v) @ T1.T)
