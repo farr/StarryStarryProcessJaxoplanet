@@ -151,8 +151,7 @@ def _build_clmmpi_tensor_numpy(l):
 
 def set_clmmpi_tensor(lmax):
     """Build/cache all C tensors up to lmax in one numpy array.
-    For degree l, retrieve C_l with _C_block(C_all, l). The cache is keyed
-    by lmax, so repeated calls at the same maximum degree do no rebuilding.
+    For degree l, retrieve C_l with _C_block(C_all, l). 
     """
     lmax = int(lmax)
     if lmax not in _clmmpi_cache:
@@ -233,8 +232,7 @@ def Pllpphimmp(l, lp, alpha, beta, ebar, ebarp, Q, C_l, C_lp, term1=None):
     """The whole (2l+1, 2lp+1) P^{l,l'}_phi block.
 
     Pass term1 = beta_norm(alpha, beta) when calling in a loop so it is
-    computed once rather than per block. Index arrays and phases are NumPy, so
-    they are compile-time constants instead of traced ops.
+    computed once rather than per block. 
     """
     c1 = C_l[:, l, :]                  # (m, i)
     c2 = C_lp[:, lp, :]                # (mp, ip)
@@ -250,9 +248,9 @@ def Pllpphimmp(l, lp, alpha, beta, ebar, ebarp, Q, C_l, C_lp, term1=None):
     return term1 * ebar[l] * ebarp[lp] * phase * sumterm
 
 
-# The lambda step plus the U back-transform is a constant linear map on each
+# The lambda step plus the U is a constant linear map on each
 # (l, lp) block: block = real(conj(U_l).T @ Pllplambdammp(Pphi) @ conj(U_lp)).
-# I contract it once per (l, lp) and cache it.
+# I do it once per (l, lp) and cache it.
 _lambda_kernel_cache = {}
 
 
@@ -390,7 +388,7 @@ def compute_second_moment(alpha, beta, r, c, lmax):
         Ul = Us[l]
         erbarl = erbar[l]
 
-        # The second moment is symmetric, so only compute lp >= l.
+        # The second moment is symmetric, so only compute lp >= l!!!
         for lp in range(l, lmax + 1):
 
             Ulp = Us[lp]
@@ -408,7 +406,6 @@ def compute_second_moment(alpha, beta, r, c, lmax):
             blocks[l][lp] = block
             blocks[lp][l] = block.T
 
-    # One assembly at the end instead of (lmax+1)**2 full-matrix .at[].set updates.
     return jnp.block(blocks)
 
 

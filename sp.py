@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import scipy
 
-from SabinasStarryProcess1 import compute_mean, compute_covariance
+from SabinasStarryProcess_fast import compute_mean, compute_covariance, compute_mean_and_covariance
 from design_matrix_jaxoplanet import design_matrix as _design_matrix
 
 from jaxoplanet.core.limb_dark import light_curve as _limb_dark_light_curve
@@ -110,10 +110,14 @@ class StarryProcess:
     # Moments
     # ------------------------------------------------------------------
 
+    # def moments(self):
+    #     mean_ylm = compute_mean(self.alpha,self.beta,self.r,self.contrast,self.nspots,lmax=self.lmax)
+    #     cov_ylm = compute_covariance(self.alpha,self.beta,self.r,self.contrast,self.nspots,lmax=self.lmax)
+    #     return mean_ylm, cov_ylm
+    
     def moments(self):
-        mean_ylm = compute_mean(self.alpha,self.beta,self.r,self.contrast,self.nspots,lmax=self.lmax)
-        cov_ylm = compute_covariance(self.alpha,self.beta,self.r,self.contrast,self.nspots,lmax=self.lmax)
-        return mean_ylm, cov_ylm
+        mean, cov = compute_mean_and_covariance(self.alpha,self.beta,self.r,self.contrast,self.nspots,lmax=self.lmax)
+        return mean, cov
 
     @property
     def mean_ylm(self):
