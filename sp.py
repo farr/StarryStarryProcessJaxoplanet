@@ -49,15 +49,17 @@ def alpha_beta_to_latitude(alpha, beta):
 def ab_to_latitude(a, b):
     return alpha_beta_to_latitude(*ab_to_alpha_beta(a, b))
 
-
 def gauss_to_ab(mu_deg, sigma_deg):
+    return alpha_beta_to_ab(*gauss_to_alpha_beta(mu_deg, sigma_deg))
+
+def gauss_to_alpha_beta(mu_deg, sigma_deg):
     mu = jnp.deg2rad(jnp.asarray(mu_deg))
     sigma2 = jnp.square(jnp.deg2rad(jnp.asarray(sigma_deg)))
 
     term = 1.0 / (16.0 * sigma2 * jnp.cos(0.5 * mu) ** 4)
     alpha = (2.0 + 4.0 * sigma2 + (3.0 + 8.0 * sigma2) * jnp.cos(mu) + 2.0 * jnp.cos(2.0 * mu) + jnp.cos(3.0 * mu)) * term
     beta = (jnp.cos(mu) + 2.0 * sigma2 * (3.0 + jnp.cos(2.0 * mu)) - jnp.cos(3.0 * mu)) * term
-    return alpha_beta_to_ab(alpha, beta)
+    return alpha, beta
 
 
 # ---------------------------------------------------------------------------
