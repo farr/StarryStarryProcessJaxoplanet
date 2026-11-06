@@ -8,7 +8,7 @@ from functools import partial
 
 import functools
 
-from utils import hyp2f1_sequence, gamma_sequence1, gamma_sequence2
+from utils import hyp2f1_sequence, gamma_sequence1, gamma_sequence2, hyp2f1_1_b_c_m1, Fam, Fcm
 
 
 def log_factorial(x):
@@ -293,19 +293,33 @@ def _legendre_basis(lmax, x):
     return jnp.stack(P)
 
 
+# Manual cache of the spot basis, keyed by (lmax, spts, eps, smoothing).  It does
+# not depend on (r, c), and XLA does *not* constant-fold it inside jit (the
+# linalg.solve is a LAPACK custom call), so build it once in numpy.
+_spot_basis_cache = {}
+
+
 def _spot_basis(lmax, spts, eps, smoothing):
+    key = (int(lmax), int(spts), float(eps), float(smoothing))
+    if key not in _spot_basis_cache:
+        theta = np.linspace(0.0, np.pi, spts)
+        cost = np.cos(theta)
+        l = np.arange(lmax + 1)
 
-    theta = jnp.linspace(0.0, jnp.pi, spts)
-    cost = jnp.cos(theta)
-    l = jnp.arange(lmax + 1)
+        # Legendre P_0..P_lmax via the Bonnet recurrence (numpy twin of _legendre_basis).
+        P = np.empty((lmax + 1, spts))
+        P[0] = 1.0
+        if lmax > 0:
+            P[1] = cost
+        for ell in range(1, lmax):
+            P[ell + 1] = ((2 * ell + 1) * cost * P[ell] - ell * P[ell - 1]) / (ell + 1)
 
-    P = _legendre_basis(lmax, cost)
-    B = (jnp.sqrt(2.0 * l + 1.0)[:, None] * P).T
-    Bp = jnp.linalg.solve(B.T @ B + eps * jnp.eye(lmax + 1), B.T)
-    idx = l * (l + 1)
-    Sm = jnp.exp(-0.5 * idx * smoothing ** 2)
-    Bp = Sm[:, None] * Bp
-    return theta, Bp, idx
+        B = (np.sqrt(2.0 * l + 1.0)[:, None] * P).T
+        Bp = np.linalg.solve(B.T @ B + eps * np.eye(lmax + 1), B.T)
+        idx = l * (l + 1)
+        Sm = np.exp(-0.5 * idx * smoothing ** 2)
+        _spot_basis_cache[key] = (theta, Sm[:, None] * Bp, idx)
+    return _spot_basis_cache[key]
 
 
 # def compute_radius_moment(lmax, r, c, smoothing=0.075, spts=1000, eps=1e-9, sfac=300):
@@ -328,86 +342,113 @@ def compute_radius_moment(lmax, r, c, smoothing=0.075, spts=1000, eps=1e-9, sfac
     N = (lmax + 1) ** 2
     return jnp.zeros(N).at[idx].set(yl)
 
+def qlphi_padded(alpha, beta, l, lpad):
+    """q^l_phi = gamma_sequence1 * hyp2f1_sequence, zero-padded to length 2*lpad+1.
+
+    Unlike `qlphi`, `l` may be traced, so this can be vmapped over all degrees
+    at once (one pair of scans instead of one pair per degree).  Recurrence
+    steps past i = 2l are clamped to i = 2l, so the padding never evaluates
+    the recurrence at a pole (keeps values *and* gradients finite); those
+    entries are then masked to zero.  Entries i <= 2l equal `qlphi(alpha, beta, l)`.
+    """
+    imax = 2 * lpad
+    i_all = jnp.arange(0, imax + 1, 2)
+    i_eff = jnp.minimum(i_all, 2 * l)
+
+    # gamma_sequence1
+    g0 = jnp.exp(jax.lax.lgamma(alpha) + jax.lax.lgamma(l + beta + 1.0)
+                 - jax.lax.lgamma(l + alpha + beta + 1.0))
+
+    def gstep(state, i):
+        nxt = state * (l + alpha + beta - i / 2) / (l + beta - i / 2)
+        return nxt, nxt
+
+    _, gam = jlx.scan(gstep, g0, i_eff)
+
+    # hyp2f1_sequence
+    F0 = (hyp2f1_1_b_c_m1(alpha, l + alpha + beta),
+          hyp2f1_1_b_c_m1(alpha, l + alpha + beta + 1.0))
+
+    def fstep(state, i):
+        F_, Fcp_ = state
+        Fam_ = Fam(F_, Fcp_, l, alpha, beta, i)
+        Fcm_ = Fcm(Fam_, F_, l, alpha, beta, i)
+        return (Fcm_, Fam_), Fam_
+
+    _, hyp = jlx.scan(fstep, F0, i_eff)
+
+    evens = jnp.where(i_all <= 2 * l, gam * hyp, 0.0)
+    return jnp.zeros(imax + 1).at[0::2].set(evens)
+
+
+def qlphi_all(alpha, beta, Lmax):
+    """Stack of qlphi_padded for L = 0..Lmax, shape (Lmax+1, 2*Lmax+1)."""
+    return jax.vmap(lambda L: qlphi_padded(alpha, beta, L, Lmax))(jnp.arange(Lmax + 1))
+
+
+# Everything in E[y] that does not depend on (alpha, beta, r, c), cached per lmax.
+_first_moment_cache = {}
+
+
+def _first_moment_constants(lmax):
+    """Precompute the constant pieces of E[y] = beta_norm * M @ g, where
+
+        g_row = erbar_{l,0} * sum_i C_l[m, 0, i] q^phi_l[i]       (real)
+        M     = Re(U^H Lambda U) @ Re(U^H diag(i^m))               (N x N, real)
+
+    and Lambda is the block-diagonal sum_i C_l[a, m, i] q^lambda_l[i].  The
+    Re(.) factorization is exact because g and E_phi are real.
+    """
+    lmax = int(lmax)
+    if lmax not in _first_moment_cache:
+        N = (lmax + 1) ** 2
+        K = 2 * lmax + 1
+        U = set_Uylm(lmax)
+        C_all = set_clmmpi_tensor(lmax)
+
+        ell_row = np.zeros(N, dtype=np.int32)   # degree of each flat row
+        m_row = np.zeros(N)                     # order m of each flat row
+        C0 = np.zeros((N, K))                   # C_l[m, mp=0, :] for each flat row
+        Lam = np.zeros((N, N))
+        for l in range(lmax + 1):
+            s, e = l**2, (l + 1) ** 2
+            ell_row[s:e] = l
+            m_row[s:e] = np.arange(-l, l + 1)
+            C0[s:e] = C_all[s:e, s + l, :]
+            with jax.ensure_compile_time_eval():
+                ql = np.asarray(qllambda(l))
+            Lam[s:e, s:e] = np.einsum("ami,i->am", C_all[s:e, s:e, :2 * l + 1], ql)
+
+        UH = U.conj().T
+        B = np.real(UH @ np.diag(np.exp(1j * np.pi * m_row / 2)))
+        A = np.real(UH @ Lam @ U)
+
+        # m = 0 rows of U pick erbar_{l,0} out of er; they are real.
+        U0 = U[[l * l + l for l in range(lmax + 1)], :]
+        assert np.allclose(U0.imag, 0.0)
+
+        _first_moment_cache[lmax] = (A @ B, C0, ell_row, np.real(U0))
+    return _first_moment_cache[lmax]
+
+
 @partial(jax.jit, static_argnames="lmax")
 def compute_first_moment(alpha, beta, r, c, lmax):
     """
-    Compute E[y] using jax.lax.fori_loop.
+    Compute E[y].
+
+    Vectorized over l: the per-degree phi and lambda steps are folded into one
+    constant matrix M (see _first_moment_constants), and q^phi_l is computed
+    for all l at once.  Equivalent to, for each l,
+        ephi_l    = Re(U_l^H plphim(l, U_l er_l, alpha, beta, qlphi(alpha, beta, l)))
+        elambda_l = Re(U_l^H pllambdam(l, U_l ephi_l, qllambda(l)))
     """
+    M, C0, ell_row, U0 = _first_moment_constants(lmax)
     er = compute_radius_moment(lmax, r, c)
-    U_all = set_Uylm(lmax)
 
-    N = (lmax + 1) ** 2
-    branches = []
-
-    for l in range(lmax + 1):
-        def branch(args, l=l):
-            alpha, beta, er, out = args
-
-            u = _U_block(U_all, l)
-
-            q_phi_l = qlphi(alpha, beta, l)
-            q_lambda_l = qllambda(l)
-
-            start = l**2
-            stop = (l + 1)**2
-
-            erl = er[start:stop]
-            erlbar = u @ erl
-
-            p = plphim(l, erlbar, alpha, beta, q_phi_l)
-
-            ephi = jnp.real(jnp.conj(u.T) @ p)
-            ebarphi = u @ ephi
-
-            plambda = pllambdam(l, ebarphi, q_lambda_l)
-            elambda = jnp.real(jnp.conj(u.T) @ plambda)
-
-            return out.at[start:stop].set(elambda)
-
-        branches.append(branch)
-
-    def body_fn(l, out):
-        return jax.lax.switch(
-            l,
-            branches,
-            (alpha, beta, er, out),
-        )
-
-    out = jnp.zeros(N)
-    return jax.lax.fori_loop(0, lmax + 1, body_fn, out)
-
-# @partial(jax.jit, static_argnames="lmax")
-# def compute_first_moment(alpha, beta, r, c, lmax):
-#     """
-#     Compute E[y]
-#     """
-#     er = compute_radius_moment(lmax, r, c)
-
-#     ephi = []
-#     elambda = []
-#     U_all = set_Uylm(lmax)
-
-#     for l in range(0, lmax + 1):
-#         u = _U_block(U_all, l)
-
-#         q_phi_l = qlphi(alpha, beta, l)
-#         q_lambda_l = qllambda(l)
-
-#         erl = er[l**2:(l + 1)**2]
-#         erlbar = u @ erl
-#         p = plphim(l, erlbar, alpha, beta, q_phi_l)
-
-#         ephi_ = jnp.real(jnp.conj(u.T) @ p)
-#         ephi.append(ephi_)
-#         ebarphi = u @ ephi_
-
-#         plambda = pllambdam(l, ebarphi, q_lambda_l)
-#         elambda.append(jnp.real(jnp.conj(u.T) @ plambda))
-
-#     elambda = jnp.concatenate(elambda)
-#     ephi = jnp.concatenate(ephi)
-
-#     return elambda
+    Q = qlphi_all(alpha, beta, lmax)                         # (lmax+1, 2lmax+1)
+    erbar0 = U0 @ er                                         # (lmax+1,)
+    g = erbar0[ell_row] * jnp.sum(C0 * Q[ell_row], axis=1)   # (N,)
+    return beta_norm(alpha, beta) * (M @ g)
 
 @partial(jax.jit, static_argnames="lmax")
 def compute_second_moment(alpha, beta, r, c, lmax):
@@ -434,11 +475,9 @@ def compute_second_moment(alpha, beta, r, c, lmax):
         for ell in range(lmax + 1)
     )
 
-    # Q_phi depends only on L = l + lp.
-    Q_phi = tuple(
-        Qllpphi(alpha, beta, L, 0)
-        for L in range(2 * lmax + 1)
-    )
+    # Q_phi depends only on L = l + lp.  Row L is Qllpphi(alpha, beta, L, 0)
+    # zero-padded to length 4*lmax+1; computed for all L in one vmapped scan.
+    Q_phi = qlphi_all(alpha, beta, 2 * lmax)
 
     term1 = beta_norm(alpha, beta)
 

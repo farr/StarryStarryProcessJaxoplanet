@@ -12,6 +12,32 @@ def Fcm(F, Fap, l, alpha, beta, i):
     b, c, d)`."""
     return (alpha + beta + l - 1) / (alpha + beta + l - (i+2)/2) * F + i / (i - 2*(alpha + beta + l - 1)) * Fap
 
+def hyp2f1_1_b_c_m1(b, c, nterms=60):
+    r"""Compute `2F1(1, b; c; -1)` for `b > 0`, `c > 0`.
+
+    `jax.scipy.special.hyp2f1` is slow and inaccurate on the unit circle (relative
+    errors ~1e-8 at z = -1, which the upward recurrence in `hyp2f1_sequence`
+    amplifies to O(10%)).  Instead use the Pfaff transformation
+
+    .. math::
+
+        {}_2F_1(1, b; c; -1) = \frac{1}{2} {}_2F_1\left(1, c - b; c; \frac{1}{2}\right),
+
+    whose series has positive terms with successive ratio `(c - b + n) / (c + n) / 2 < 1/2`
+    (for `b > 0`), so a fixed `nterms = 60` gives machine precision.  Branch-free,
+    vmappable, and cheap to differentiate.
+
+    .. doctest::
+
+        >>> import jax.scipy.special as jss
+        >>> b, c = 2.0, 10.0
+        >>> jnp.allclose(hyp2f1_1_b_c_m1(b, c), jss.hyp2f1(1.0, b, c, -1.0))
+        Array(True, dtype=bool)
+    """
+    n = jnp.arange(nterms - 1, dtype=jnp.result_type(float))
+    ratios = 0.5 * (c - b + n) / (c + n)
+    return 0.5 * (1.0 + jnp.sum(jnp.cumprod(ratios)))
+
 def hyp2f1_sequence(l, alpha, beta, imax=None):
     r"""Returns a sequence of `2F1` hypergeometric function values at even
     indices.
@@ -51,7 +77,7 @@ def hyp2f1_sequence(l, alpha, beta, imax=None):
     if imax is None:
         imax = 2 * l
 
-    init = (jss.hyp2f1(1.0, alpha, l + alpha + beta, -1.0), jss.hyp2f1(1.0, alpha, l + alpha + beta + 1, -1.0))
+    init = (hyp2f1_1_b_c_m1(alpha, l + alpha + beta), hyp2f1_1_b_c_m1(alpha, l + alpha + beta + 1))
 
     def scan_f(state, i):
         F_, Fcp_ = state
