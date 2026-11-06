@@ -454,6 +454,51 @@ def compute_first_moment(alpha, beta, r, c, lmax):
 _second_moment_cache = {}
 
 
+# Eigenbasis of the Wigner d-matrices, shared by the lambda step and the
+# inclination marginalization, cached per lmax.
+_wigner_eigenbasis_cache = {}
+
+
+def wigner_d(l, theta, C_all):
+    """D^l(theta) = 2^l sum_i C_l[:, :, i] cos^i(theta/2) sin^(2l-i)(theta/2), in numpy.
+
+    This is the (real, orthogonal) Wigner d-matrix in the complex-Ylm basis used
+    throughout; C_all is set_clmmpi_tensor(lmax) for some lmax >= l.
+    """
+    s, e = l**2, (l + 1) ** 2
+    i = np.arange(2 * l + 1)
+    return 2.0**l * np.einsum("abi,i->ab", C_all[s:e, s:e, :2 * l + 1],
+                              np.cos(theta / 2) ** i * np.sin(theta / 2) ** (2 * l - i))
+
+
+def _wigner_eigenbasis(lmax):
+    """Block-diagonal unitary V and integer orders mu with D^l(theta) = V diag(e^{i mu theta}) V^H.
+
+    Because D(theta) is a one-parameter rotation group, any average of
+    D X D^T over a distribution of theta is, in this basis, a Hadamard product:
+        E[D X D^T] = V [F * (V^H X V)] V^H,   F_pq = E[exp(i (mu_p - mu_q) theta)].
+    """
+    lmax = int(lmax)
+    if lmax not in _wigner_eigenbasis_cache:
+        N = (lmax + 1) ** 2
+        C_all = set_clmmpi_tensor(lmax)
+        V = np.zeros((N, N), dtype=np.complex128)
+        mu_row = np.zeros(N)
+        theta1 = 0.1   # any angle with |mu * theta1| < pi for all |mu| <= lmax
+        for l in range(lmax + 1):
+            s, e = l**2, (l + 1) ** 2
+            D = wigner_d(l, theta1, C_all)
+            w, v = np.linalg.eig(D)
+            mu = np.rint(np.angle(w) / theta1)
+            assert np.allclose(np.abs(w), 1.0) and len(set(mu)) == 2 * l + 1
+            v, _ = np.linalg.qr(v)   # distinct eigenvalues of a normal matrix: unitary up to phases
+            assert np.allclose(v @ np.diag(w) @ v.conj().T, D)
+            V[s:e, s:e] = v
+            mu_row[s:e] = mu
+        _wigner_eigenbasis_cache[lmax] = (V, mu_row)
+    return _wigner_eigenbasis_cache[lmax]
+
+
 def _second_moment_constants(lmax):
     """Precompute the constant pieces of E[y y^T].
 
@@ -480,10 +525,8 @@ def _second_moment_constants(lmax):
         m_row = np.zeros(N)                         # order m of each flat row
         pad_idx = np.zeros(N, dtype=np.int32)       # flat row -> index in the (lmax+1)*K padded layout
         C0pad = np.zeros((lmax + 1, K, K))          # C_l[m, mp=0, :], with m padded to K
-        V = np.zeros((N, N), dtype=np.complex128)   # eigenbasis of the lambda rotation
-        mu_row = np.zeros(N)                        # its eigen-order mu
+        V, mu_row = _wigner_eigenbasis(lmax)
 
-        theta1 = 0.1   # any angle with |mu * theta1| < pi for all |mu| <= lmax
         for l in range(lmax + 1):
             s, e = l**2, (l + 1) ** 2
             n = 2 * l + 1
@@ -491,17 +534,6 @@ def _second_moment_constants(lmax):
             m_row[s:e] = np.arange(-l, l + 1)
             pad_idx[s:e] = l * K + np.arange(n)
             C0pad[l, :n, :] = C_all[s:e, s + l, :]
-
-            i = np.arange(n)
-            D = 2.0**l * np.einsum("abi,i->ab", C_all[s:e, s:e, :n],
-                                   np.cos(theta1 / 2) ** i * np.sin(theta1 / 2) ** (2 * l - i))
-            w, v = np.linalg.eig(D)
-            mu = np.rint(np.angle(w) / theta1)
-            assert np.allclose(np.abs(w), 1.0) and len(set(mu)) == n
-            v, _ = np.linalg.qr(v)   # distinct eigenvalues of a normal matrix: unitary up to phases
-            assert np.allclose(v @ np.diag(w) @ v.conj().T, D)
-            V[s:e, s:e] = v
-            mu_row[s:e] = mu
 
         phase = np.exp(1j * np.pi * m_row / 2)
         VH = V.conj().T
@@ -584,12 +616,39 @@ def compute_mean_and_covariance(alpha, beta, r, c, n, lmax):
 import jax.scipy.special as jss
 from jaxoplanet.starry.core.rotation import dot_rotation_matrix
 
+# Inclination marginalization.  The inclination moments are
+#     qlI(L)[k] = (-1)^k / (L - k/2 + 1) 2F1(1, -k/2; L - k/2 + 2; -1)
+#               = E_inc[2^L cos^k(theta/2) sin^(2L-k)(theta/2)],   theta = -inc,
+# with inc isotropic on [0, pi/2] (density sin(inc)).  They do not depend on any
+# parameters, so the marginalized moments are constant linear maps of ey / Ey,
+# precomputed below.  Gauss-Legendre in inc converges spectrally (integrand is
+# entire); NQUAD_INC nodes give machine precision well past lmax = 15.
+NQUAD_INC = 256
+
+
+def _inclination_quadrature(n=NQUAD_INC):
+    """Nodes theta = -inc and weights (summing to 1) for inc isotropic on [0, pi/2]."""
+    x, w = np.polynomial.legendre.leggauss(n)
+    inc = np.pi / 4 * (x + 1.0)
+    return -inc, w * np.pi / 4 * np.sin(inc)
+
+
 def qlI(l, imax=None):
+    """Inclination moments, computed in numpy by quadrature (no 2F1 at z = -1).
+
+    Entries beyond 2l (if imax > 2l) follow the same formula as before.
+    """
     if imax is None:
         imax = 2 * l
-    i = jnp.arange(imax + 1)
-    F = jss.hyp2f1(1.0, -i / 2.0, 2.0 + (2 * l - i) / 2.0, -1.0)
-    return (-1.0) ** i / ((2 * l - i) / 2.0 + 1.0) * F
+    theta, w = _inclination_quadrature()
+    k = np.arange(imax + 1)[:, None]
+    if imax <= 2 * l:
+        q = (w * 2.0**l * np.cos(theta / 2) ** k * np.sin(theta / 2) ** (2 * l - k)).sum(1)
+    else:   # fall back to the closed form (scipy is accurate here) for the unused tail
+        import scipy.special as ss
+        kk = k[:, 0]
+        q = (-1.0) ** kk / ((2 * l - kk) / 2.0 + 1.0) * ss.hyp2f1(1.0, -kk / 2.0, 2.0 + (2 * l - kk) / 2.0, -1.0)
+    return jnp.asarray(q)
 
 
 def QllI(l, lp):
@@ -620,39 +679,71 @@ def PllImmp(l, lp, Ebar_block, Q, C_l, C_lp):
     phase = jnp.exp(1j * jnp.pi / 2 * (m - mu + mp - mup))
     return jnp.einsum('uv,aubv,aubv->ab', Ebar_block, phase, T)
 
+_marginalized_cache = {}
+
+
+def _marginalized_constants(lmax):
+    """Constant maps for the inclination-marginalized moments.
+
+    Per degree, the old code computed (Phi = diag(i^m), D = Wigner d-matrix)
+        first:  ey00 = Re(U^H Phi E[D] Phi^* U ey0),                 ey0 = Re(Rx(pi/2) ey)
+        second: Ey00 = Re(U^H Phi E[D X D^T] Phi conj(U)),  X = Phi^* U Ey0 U^T Phi^*,
+                Ey0 = R Ey R^T with R = Rx(pi/2).
+    i.e. with the real map L(theta) = Re(U^H Phi D(theta) Phi^* U) R, first = E[L] ey and
+    second = E[L Ey L^T], so the marginal covariance is PSD.  (The previous loop
+    version used U Ey0 U^H, i.e. conj(U)^T instead of U^T, and R^T Ey R instead of
+    R Ey R^T; both made it inconsistent with the first moment.)
+    With D = V diag(e^{i mu theta}) V^H (see _wigner_eigenbasis):
+        E[D]         = V diag(f) V^H,           f_p  = E[exp(i mu_p theta)]
+        E[D X D^T]   = V [F * (V^H X V)] V^H,   F_pq = E[exp(i (mu_p - mu_q) theta)]
+    """
+    lmax = int(lmax)
+    if lmax not in _marginalized_cache:
+        N = (lmax + 1) ** 2
+        U = set_Uylm(lmax)
+        V, mu_row = _wigner_eigenbasis(lmax)
+        VH = V.conj().T
+        m_row = np.concatenate([np.arange(-l, l + 1) for l in range(lmax + 1)])
+        phase = np.exp(1j * np.pi * m_row / 2)
+
+        theta, w = _inclination_quadrature()
+        f = (w * np.exp(1j * mu_row[:, None] * theta)).sum(1)
+        dmu = np.arange(-2 * lmax, 2 * lmax + 1)
+        Fd = (w * np.exp(1j * dmu[:, None] * theta)).sum(1)
+        F = Fd[(mu_row[:, None] - mu_row[None, :]).astype(int) + 2 * lmax]
+
+        # Rx(pi/2) as an explicit matrix R with R @ y == Rx(lmax, pi/2, y).
+        # NB: dot_rotation_matrix acts on the *rows* of a matrix argument, so
+        # Rx(lmax, pi/2, eye(N)) is R^T, not R.  (The previous second moment used
+        # Rx(eye) @ Ey @ Rx(eye).T = R^T Ey R, inconsistent with the first moment's
+        # R @ ey, which made the marginal covariance indefinite for lmax >= 3.)
+        with jax.ensure_compile_time_eval():
+            R = np.asarray(Rx(lmax, jnp.pi / 2, jnp.eye(N))).T
+        assert np.allclose(np.imag(R), 0.0)
+        R = np.real(R)
+
+        UH = U.conj().T
+        M1 = np.real(UH @ (phase[:, None] * (V @ (f[:, None] * VH))) @ (phase.conj()[:, None] * U)) @ R
+
+        _marginalized_cache[lmax] = dict(
+            M1=M1,
+            Gl=(VH * phase.conj()[None, :]) @ U @ R,          # V^H Phi^* U R
+            Gr=R.T @ U.T @ (phase.conj()[:, None] * V),        # R^T U^T Phi^* V
+            A=UH @ (phase[:, None] * V),                       # U^H Phi V
+            B=(VH * phase[None, :]) @ U.conj(),                # V^H Phi conj(U)
+            F=F,
+        )
+    return _marginalized_cache[lmax]
+
+
 @partial(jax.jit, static_argnames="lmax")
 def compute_first_moment_marginalized(ey, lmax):
-    N = (lmax + 1) ** 2
-    ey0 = jnp.real(Rx(lmax, jnp.pi / 2, ey))
+    """Inclination-marginalized E[y]: a constant (N, N) matrix applied to ey."""
+    return _marginalized_constants(lmax)["M1"] @ ey
 
-    ey00 = []
-    U_all = set_Uylm(lmax)
-    for l in range(lmax + 1):
-        u = _U_block(U_all, l)
-        ebar = u @ ey0[l**2:l**2 + 2*l + 1]
-        pI = plIm(l, ebar, qlI(l))
-        ey00.append(jnp.real(jnp.conj(u.T) @ pI))
-
-    return jnp.concatenate(ey00)
 
 @partial(jax.jit, static_argnames="lmax")
 def compute_second_moment_marginalized(Ey, lmax):
-    N = (lmax + 1) ** 2
-    Rxhalf = Rx(lmax, jnp.pi / 2, jnp.eye(N))
-    Ey0 = Rxhalf @ Ey @ Rxhalf.T
-
-    U_all = set_Uylm(lmax)
-    Us = [_U_block(U_all, ell) for ell in range(lmax + 1)]
-    C_all = set_clmmpi_tensor(lmax)
-    Cs = [_C_block(C_all, ell) for ell in range(lmax + 1)]
-
-    Ey00 = jnp.zeros((N, N), dtype=jnp.complex128)
-    for l in range(lmax + 1):
-        for lp in range(lmax + 1):
-            blk = Ey0[l**2:l**2 + 2*l + 1, lp**2:lp**2 + 2*lp + 1]
-            Ebar = Us[l] @ blk @ jnp.conj(Us[lp]).T
-            PllI = PllImmp(l, lp, Ebar, QllI(l, lp), Cs[l], Cs[lp])
-            block = jnp.conj(Us[l]).T @ PllI @ jnp.conj(Us[lp])
-            Ey00 = Ey00.at[l**2:l**2 + 2*l + 1, lp**2:lp**2 + 2*lp + 1].set(block)
-
-    return jnp.real(Ey00)
+    """Inclination-marginalized E[y y^T]: Re(A [F * (Gl Ey Gr)] B), constants precomputed."""
+    k = _marginalized_constants(lmax)
+    return jnp.real(k["A"] @ (k["F"] * (k["Gl"] @ Ey @ k["Gr"])) @ k["B"])
