@@ -331,82 +331,232 @@ def compute_radius_moment(lmax, r, c, smoothing=0.075, spts=1000, eps=1e-9, sfac
 @partial(jax.jit, static_argnames="lmax")
 def compute_first_moment(alpha, beta, r, c, lmax):
     """
-    Compute E[y]
+    Compute E[y] using jax.lax.fori_loop.
     """
     er = compute_radius_moment(lmax, r, c)
-
-    ephi = []
-    elambda = []
     U_all = set_Uylm(lmax)
 
-    for l in range(0, lmax + 1):
-        u = _U_block(U_all, l)
+    N = (lmax + 1) ** 2
+    branches = []
 
-        q_phi_l = qlphi(alpha, beta, l)
-        q_lambda_l = qllambda(l)
+    for l in range(lmax + 1):
+        def branch(args, l=l):
+            alpha, beta, er, out = args
 
-        erl = er[l**2:(l + 1)**2]
-        erlbar = u @ erl
-        p = plphim(l, erlbar, alpha, beta, q_phi_l)
+            u = _U_block(U_all, l)
 
-        ephi_ = jnp.real(jnp.conj(u.T) @ p)
-        ephi.append(ephi_)
-        ebarphi = u @ ephi_
+            q_phi_l = qlphi(alpha, beta, l)
+            q_lambda_l = qllambda(l)
 
-        plambda = pllambdam(l, ebarphi, q_lambda_l)
-        elambda.append(jnp.real(jnp.conj(u.T) @ plambda))
+            start = l**2
+            stop = (l + 1)**2
 
-    elambda = jnp.concatenate(elambda)
-    ephi = jnp.concatenate(ephi)
+            erl = er[start:stop]
+            erlbar = u @ erl
 
-    return elambda
+            p = plphim(l, erlbar, alpha, beta, q_phi_l)
+
+            ephi = jnp.real(jnp.conj(u.T) @ p)
+            ebarphi = u @ ephi
+
+            plambda = pllambdam(l, ebarphi, q_lambda_l)
+            elambda = jnp.real(jnp.conj(u.T) @ plambda)
+
+            return out.at[start:stop].set(elambda)
+
+        branches.append(branch)
+
+    def body_fn(l, out):
+        return jax.lax.switch(
+            l,
+            branches,
+            (alpha, beta, er, out),
+        )
+
+    out = jnp.zeros(N)
+    return jax.lax.fori_loop(0, lmax + 1, body_fn, out)
+
+# @partial(jax.jit, static_argnames="lmax")
+# def compute_first_moment(alpha, beta, r, c, lmax):
+#     """
+#     Compute E[y]
+#     """
+#     er = compute_radius_moment(lmax, r, c)
+
+#     ephi = []
+#     elambda = []
+#     U_all = set_Uylm(lmax)
+
+#     for l in range(0, lmax + 1):
+#         u = _U_block(U_all, l)
+
+#         q_phi_l = qlphi(alpha, beta, l)
+#         q_lambda_l = qllambda(l)
+
+#         erl = er[l**2:(l + 1)**2]
+#         erlbar = u @ erl
+#         p = plphim(l, erlbar, alpha, beta, q_phi_l)
+
+#         ephi_ = jnp.real(jnp.conj(u.T) @ p)
+#         ephi.append(ephi_)
+#         ebarphi = u @ ephi_
+
+#         plambda = pllambdam(l, ebarphi, q_lambda_l)
+#         elambda.append(jnp.real(jnp.conj(u.T) @ plambda))
+
+#     elambda = jnp.concatenate(elambda)
+#     ephi = jnp.concatenate(ephi)
+
+#     return elambda
 
 @partial(jax.jit, static_argnames="lmax")
 def compute_second_moment(alpha, beta, r, c, lmax):
+
     N = (lmax + 1) ** 2
     er = compute_radius_moment(lmax, r, c)
 
     U_all = set_Uylm(lmax)
-    Us = [_U_block(U_all, ell) for ell in range(lmax + 1)]
     C_all = set_clmmpi_tensor(lmax)
-    Cs = [_C_block(C_all, ell) for ell in range(lmax + 1)]
 
-    # Precompute each degree's transformed radius coefficients once.
-    erbar = []
-    for ell in range(lmax + 1):
-        er_l = er[ell**2:(ell + 1)**2]
-        erbar.append(Us[ell] @ er_l)
+    Us = tuple(
+        _U_block(U_all, ell)
+        for ell in range(lmax + 1)
+    )
 
-    # Q_phi depends only on L = l + lp: build each one once, not once per block!!!
-    Q_phi = [Qllpphi(alpha, beta, L, 0) for L in range(2 * lmax + 1)]
+    Cs = tuple(
+        _C_block(C_all, ell)
+        for ell in range(lmax + 1)
+    )
+
+    # Precompute transformed radius coefficients.
+    erbar = tuple(
+        Us[ell] @ er[ell**2:(ell + 1)**2]
+        for ell in range(lmax + 1)
+    )
+
+    # Q_phi depends only on L = l + lp.
+    Q_phi = tuple(
+        Qllpphi(alpha, beta, L, 0)
+        for L in range(2 * lmax + 1)
+    )
+
     term1 = beta_norm(alpha, beta)
 
-    blocks = [[None] * (lmax + 1) for _ in range(lmax + 1)]
+    # Construct one static branch per (l, lp).
+    branches = []
 
     for l in range(lmax + 1):
+        for lp in range(lmax + 1):
 
-        Ul = Us[l]
-        erbarl = erbar[l]
+            def branch(out, l=l, lp=lp):
 
-        # The second moment is symmetric, so only compute lp >= l!!!
-        for lp in range(l, lmax + 1):
+                # Only compute the upper triangular blocks.
+                if lp < l:
+                    return out
 
-            Ulp = Us[lp]
-            erbarlp = erbar[lp]
+                start_l = l**2
+                stop_l = (l + 1)**2
 
-            Q_phi_llp = Q_phi[l + lp]
+                start_lp = lp**2
+                stop_lp = (lp + 1)**2
 
-            Pphi = Pllpphimmp(l, lp, alpha, beta, erbarl, erbarlp, Q_phi_llp, Cs[l], Cs[lp], term1=term1)
+                Ul = Us[l]
+                Ulp = Us[lp]
 
-            Ebarphi_block = Pphi
+                Pphi = Pllpphimmp(
+                    l,
+                    lp,
+                    alpha,
+                    beta,
+                    erbar[l],
+                    erbar[lp],
+                    Q_phi[l + lp],
+                    Cs[l],
+                    Cs[lp],
+                    term1=term1,
+                )
 
-            # = real(conj(Ul).T @ Pllplambdammp(...) @ conj(Ulp)), with the
-            # constant part precontracted.
-            block = jnp.real(jnp.einsum('xyuv,uv->xy', lambda_kernel(l, lp, lmax), Ebarphi_block))
-            blocks[l][lp] = block
-            blocks[lp][l] = block.T
+                block = jnp.real(
+                    jnp.einsum(
+                        'xyuv,uv->xy',
+                        lambda_kernel(l, lp, lmax),
+                        Pphi,
+                    )
+                )
 
-    return jnp.block(blocks)
+                # Update both symmetric blocks.
+                out = out.at[
+                    start_l:stop_l,
+                    start_lp:stop_lp
+                ].set(block)
+
+                out = out.at[
+                    start_lp:stop_lp,
+                    start_l:stop_l
+                ].set(block.T)
+
+                return out
+
+            branches.append(branch)
+
+    def body_fn(i, out):
+        return jax.lax.switch(i, branches, out)
+
+    Ey = jnp.zeros((N, N))
+
+    return jax.lax.fori_loop(
+        0,
+        (lmax + 1)**2,
+        body_fn,
+        Ey,
+    )
+
+# @partial(jax.jit, static_argnames="lmax")
+# def compute_second_moment(alpha, beta, r, c, lmax):
+#     N = (lmax + 1) ** 2
+#     er = compute_radius_moment(lmax, r, c)
+
+#     U_all = set_Uylm(lmax)
+#     Us = [_U_block(U_all, ell) for ell in range(lmax + 1)]
+#     C_all = set_clmmpi_tensor(lmax)
+#     Cs = [_C_block(C_all, ell) for ell in range(lmax + 1)]
+
+#     # Precompute each degree's transformed radius coefficients once.
+#     erbar = []
+#     for ell in range(lmax + 1):
+#         er_l = er[ell**2:(ell + 1)**2]
+#         erbar.append(Us[ell] @ er_l)
+
+#     # Q_phi depends only on L = l + lp: build each one once, not once per block!!!
+#     Q_phi = [Qllpphi(alpha, beta, L, 0) for L in range(2 * lmax + 1)]
+#     term1 = beta_norm(alpha, beta)
+
+#     blocks = [[None] * (lmax + 1) for _ in range(lmax + 1)]
+
+#     for l in range(lmax + 1):
+
+#         Ul = Us[l]
+#         erbarl = erbar[l]
+
+#         # The second moment is symmetric, so only compute lp >= l!!!
+#         for lp in range(l, lmax + 1):
+
+#             Ulp = Us[lp]
+#             erbarlp = erbar[lp]
+
+#             Q_phi_llp = Q_phi[l + lp]
+
+#             Pphi = Pllpphimmp(l, lp, alpha, beta, erbarl, erbarlp, Q_phi_llp, Cs[l], Cs[lp], term1=term1)
+
+#             Ebarphi_block = Pphi
+
+#             # = real(conj(Ul).T @ Pllplambdammp(...) @ conj(Ulp)), with the
+#             # constant part precontracted.
+#             block = jnp.real(jnp.einsum('xyuv,uv->xy', lambda_kernel(l, lp, lmax), Ebarphi_block))
+#             blocks[l][lp] = block
+#             blocks[lp][l] = block.T
+
+#     return jnp.block(blocks)
 
 
 def compute_covariance_one(alpha, beta, r, c, lmax):
