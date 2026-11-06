@@ -450,152 +450,109 @@ def compute_first_moment(alpha, beta, r, c, lmax):
     g = erbar0[ell_row] * jnp.sum(C0 * Q[ell_row], axis=1)   # (N,)
     return beta_norm(alpha, beta) * (M @ g)
 
+# Everything in E[y y^T] that does not depend on (alpha, beta, r, c), cached per lmax.
+_second_moment_cache = {}
+
+
+def _second_moment_constants(lmax):
+    """Precompute the constant pieces of E[y y^T].
+
+    phi step:     S[p, q] = sum_ij C_lp[m_p, 0, i] C_lq[m_q, 0, j] Qphi_{lp+lq}[i + j]
+                  Pphi    = beta_norm * (e e^T) * diag(i^m) S diag(i^m),   e_p = erbar_{lp,0}
+    lambda step:  T = E_theta[D(theta) Pphi D(theta)^T],   E[y y^T] = Re(U^H T conj(U))
+
+    D^l(theta) = 2^l sum_i C_l[:, :, i] cos^i(theta/2) sin^(2l-i)(theta/2) is the Wigner
+    d-matrix, and Qlambda is exactly the average of 2^L cos^k sin^(2L-k) over a uniform
+    angle on the full circle.  So the lambda step averages a one-parameter rotation group
+    over a full period: in the eigenbasis D = V diag(e^{i mu theta}) V^H it just keeps
+    the entries with mu_p == mu_q,
+        T = V [mask * (V^H Pphi V)] V^H.
+    This replaces the per-(l, lp) lambda_kernel tensors (O(sum (2l+1)^2)^2 storage).
+    """
+    lmax = int(lmax)
+    if lmax not in _second_moment_cache:
+        N = (lmax + 1) ** 2
+        K = 2 * lmax + 1
+        U = set_Uylm(lmax)
+        C_all = set_clmmpi_tensor(lmax)
+
+        ell_row = np.zeros(N, dtype=np.int32)       # degree of each flat row
+        m_row = np.zeros(N)                         # order m of each flat row
+        pad_idx = np.zeros(N, dtype=np.int32)       # flat row -> index in the (lmax+1)*K padded layout
+        C0pad = np.zeros((lmax + 1, K, K))          # C_l[m, mp=0, :], with m padded to K
+        V = np.zeros((N, N), dtype=np.complex128)   # eigenbasis of the lambda rotation
+        mu_row = np.zeros(N)                        # its eigen-order mu
+
+        theta1 = 0.1   # any angle with |mu * theta1| < pi for all |mu| <= lmax
+        for l in range(lmax + 1):
+            s, e = l**2, (l + 1) ** 2
+            n = 2 * l + 1
+            ell_row[s:e] = l
+            m_row[s:e] = np.arange(-l, l + 1)
+            pad_idx[s:e] = l * K + np.arange(n)
+            C0pad[l, :n, :] = C_all[s:e, s + l, :]
+
+            i = np.arange(n)
+            D = 2.0**l * np.einsum("abi,i->ab", C_all[s:e, s:e, :n],
+                                   np.cos(theta1 / 2) ** i * np.sin(theta1 / 2) ** (2 * l - i))
+            w, v = np.linalg.eig(D)
+            mu = np.rint(np.angle(w) / theta1)
+            assert np.allclose(np.abs(w), 1.0) and len(set(mu)) == n
+            v, _ = np.linalg.qr(v)   # distinct eigenvalues of a normal matrix: unitary up to phases
+            assert np.allclose(v @ np.diag(w) @ v.conj().T, D)
+            V[s:e, s:e] = v
+            mu_row[s:e] = mu
+
+        phase = np.exp(1j * np.pi * m_row / 2)
+        VH = V.conj().T
+
+        # Q-index for the Hankel-like gather H[P, Q, i, j] = Qphi_{P+Q}[i + j].
+        P = np.arange(lmax + 1)
+        ii = np.arange(K)
+        H_idx = ((P[:, None, None, None] + P[None, :, None, None]) * (4 * lmax + 1)
+                 + ii[None, None, :, None] + ii[None, None, None, :])
+
+        # m = 0 rows of U pick erbar_{l,0} out of er; they are real.
+        U0 = U[[l * l + l for l in range(lmax + 1)], :]
+        assert np.allclose(U0.imag, 0.0)
+
+        _second_moment_cache[lmax] = dict(
+            ell_row=ell_row, pad_idx=pad_idx, C0pad=C0pad, H_idx=H_idx, U0=np.real(U0),
+            Gl=VH * phase[None, :],                  # V^H diag(i^m)
+            Gr=phase[:, None] * V,                   # diag(i^m) V
+            A=U.conj().T @ V,                        # U^H V
+            B=VH @ U.conj(),                         # V^H conj(U)
+            mask=(mu_row[:, None] == mu_row[None, :]).astype(float),
+        )
+    return _second_moment_cache[lmax]
+
+
 @partial(jax.jit, static_argnames="lmax")
 def compute_second_moment(alpha, beta, r, c, lmax):
+    """
+    Compute E[y y^T].
 
-    N = (lmax + 1) ** 2
+    Fully vectorized: no loop over (l, lp).  See _second_moment_constants for the
+    derivation; equivalent to the per-block
+        block_{l,lp} = Re(einsum('xyuv,uv->xy', lambda_kernel(l, lp, lmax),
+                                 Pllpphimmp(l, lp, ...)))
+    """
+    k = _second_moment_constants(lmax)
     er = compute_radius_moment(lmax, r, c)
+    erbar0 = k["U0"] @ er                                       # (lmax+1,)
 
-    U_all = set_Uylm(lmax)
-    C_all = set_clmmpi_tensor(lmax)
+    # phi step.
+    Q = qlphi_all(alpha, beta, 2 * lmax)                        # (2lmax+1, 4lmax+1)
+    H = Q.reshape(-1)[k["H_idx"]]                               # (lmax+1, lmax+1, K, K)
+    Spad = jnp.einsum("Pai,PQij,Qbj->PaQb", k["C0pad"], H, k["C0pad"], optimize="optimal")
+    n = Spad.shape[0] * Spad.shape[1]
+    S = Spad.reshape(n, n)[k["pad_idx"]][:, k["pad_idx"]]       # (N, N), real
+    e = erbar0[k["ell_row"]]
+    S = beta_norm(alpha, beta) * e[:, None] * e[None, :] * S
 
-    Us = tuple(
-        _U_block(U_all, ell)
-        for ell in range(lmax + 1)
-    )
-
-    Cs = tuple(
-        _C_block(C_all, ell)
-        for ell in range(lmax + 1)
-    )
-
-    # Precompute transformed radius coefficients.
-    erbar = tuple(
-        Us[ell] @ er[ell**2:(ell + 1)**2]
-        for ell in range(lmax + 1)
-    )
-
-    # Q_phi depends only on L = l + lp.  Row L is Qllpphi(alpha, beta, L, 0)
-    # zero-padded to length 4*lmax+1; computed for all L in one vmapped scan.
-    Q_phi = qlphi_all(alpha, beta, 2 * lmax)
-
-    term1 = beta_norm(alpha, beta)
-
-    # Construct one static branch per (l, lp).
-    branches = []
-
-    for l in range(lmax + 1):
-        for lp in range(lmax + 1):
-
-            def branch(out, l=l, lp=lp):
-
-                # Only compute the upper triangular blocks.
-                if lp < l:
-                    return out
-
-                start_l = l**2
-                stop_l = (l + 1)**2
-
-                start_lp = lp**2
-                stop_lp = (lp + 1)**2
-
-                Ul = Us[l]
-                Ulp = Us[lp]
-
-                Pphi = Pllpphimmp(
-                    l,
-                    lp,
-                    alpha,
-                    beta,
-                    erbar[l],
-                    erbar[lp],
-                    Q_phi[l + lp],
-                    Cs[l],
-                    Cs[lp],
-                    term1=term1,
-                )
-
-                block = jnp.real(
-                    jnp.einsum(
-                        'xyuv,uv->xy',
-                        lambda_kernel(l, lp, lmax),
-                        Pphi,
-                    )
-                )
-
-                # Update both symmetric blocks.
-                out = out.at[
-                    start_l:stop_l,
-                    start_lp:stop_lp
-                ].set(block)
-
-                out = out.at[
-                    start_lp:stop_lp,
-                    start_l:stop_l
-                ].set(block.T)
-
-                return out
-
-            branches.append(branch)
-
-    def body_fn(i, out):
-        return jax.lax.switch(i, branches, out)
-
-    Ey = jnp.zeros((N, N))
-
-    return jax.lax.fori_loop(
-        0,
-        (lmax + 1)**2,
-        body_fn,
-        Ey,
-    )
-
-# @partial(jax.jit, static_argnames="lmax")
-# def compute_second_moment(alpha, beta, r, c, lmax):
-#     N = (lmax + 1) ** 2
-#     er = compute_radius_moment(lmax, r, c)
-
-#     U_all = set_Uylm(lmax)
-#     Us = [_U_block(U_all, ell) for ell in range(lmax + 1)]
-#     C_all = set_clmmpi_tensor(lmax)
-#     Cs = [_C_block(C_all, ell) for ell in range(lmax + 1)]
-
-#     # Precompute each degree's transformed radius coefficients once.
-#     erbar = []
-#     for ell in range(lmax + 1):
-#         er_l = er[ell**2:(ell + 1)**2]
-#         erbar.append(Us[ell] @ er_l)
-
-#     # Q_phi depends only on L = l + lp: build each one once, not once per block!!!
-#     Q_phi = [Qllpphi(alpha, beta, L, 0) for L in range(2 * lmax + 1)]
-#     term1 = beta_norm(alpha, beta)
-
-#     blocks = [[None] * (lmax + 1) for _ in range(lmax + 1)]
-
-#     for l in range(lmax + 1):
-
-#         Ul = Us[l]
-#         erbarl = erbar[l]
-
-#         # The second moment is symmetric, so only compute lp >= l!!!
-#         for lp in range(l, lmax + 1):
-
-#             Ulp = Us[lp]
-#             erbarlp = erbar[lp]
-
-#             Q_phi_llp = Q_phi[l + lp]
-
-#             Pphi = Pllpphimmp(l, lp, alpha, beta, erbarl, erbarlp, Q_phi_llp, Cs[l], Cs[lp], term1=term1)
-
-#             Ebarphi_block = Pphi
-
-#             # = real(conj(Ul).T @ Pllplambdammp(...) @ conj(Ulp)), with the
-#             # constant part precontracted.
-#             block = jnp.real(jnp.einsum('xyuv,uv->xy', lambda_kernel(l, lp, lmax), Ebarphi_block))
-#             blocks[l][lp] = block
-#             blocks[lp][l] = block.T
-
-#     return jnp.block(blocks)
+    # lambda step: keep equal-mu entries in the eigenbasis of the lambda rotation.
+    Z = k["mask"] * (k["Gl"] @ S @ k["Gr"])
+    return jnp.real(k["A"] @ Z @ k["B"])
 
 
 def compute_covariance_one(alpha, beta, r, c, lmax):
